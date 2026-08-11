@@ -1,18 +1,22 @@
 #include <asm-generic/socket.h>
+#include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <expected>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <string>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <system_error>
 #include <unistd.h>
-
 #define PORT "8080"
 
 using namespace std;
@@ -96,9 +100,68 @@ public:
     }
   }
   int get_socket() { return sockfd->get(); }
+
+  int get_fd(bool non_block) {
+    socklen_t client_addr_size = sizeof their_addr;
+    auto client_fd =
+        accept(get_socket(), (struct sockaddr *)&their_addr, &client_addr_size);
+    if (non_block)
+      fcntl(client_fd, F_SETFL, O_NONBLOCK);
+    return client_fd;
+  }
 };
 
-string recvall(int fd) {
+class epoll_manage {
+private:
+  int epoll_fd;
+
+  bool modify_epoll_event(int epoll_fd, int client_fd, uint32_t events,
+                          int op = EPOLL_CTL_MOD) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = events | EPOLLET;
+    ev.data.fd = client_fd;
+
+    if (epoll_ctl(epoll_fd, op, client_fd, &ev) == -1) {
+      cerr << "epoll_ctl error: " << strerror(errno) << endl;
+      return false;
+    }
+    return true;
+  }
+
+public:
+  epoll_event epoll_ev[65];
+  int epoll_create() {
+    epoll_fd = ::epoll_create(69);
+    if (epoll_fd == -1) {
+      cerr << "epoll_create error: " << strerror(errno) << endl;
+    }
+    return epoll_fd;
+  }
+
+  inline bool epoll_add_read(int client_fd) {
+    return modify_epoll_event(epoll_fd, client_fd, EPOLLIN, EPOLL_CTL_ADD);
+  }
+  inline bool epoll_enable_write(int client_fd) {
+    return modify_epoll_event(epoll_fd, client_fd, EPOLLIN | EPOLLOUT,
+                              EPOLL_CTL_MOD);
+  }
+  inline bool epoll_disable_write(int client_fd) {
+    return modify_epoll_event(epoll_fd, client_fd, EPOLLIN, EPOLL_CTL_MOD);
+  }
+  inline bool epoll_remove(int client_fd) {
+    return epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr) == 0;
+  }
+};
+
+enum class Status { Ok, Disconect, Eagain };
+
+struct RecvResult {
+  string result;
+  Status status;
+};
+
+string recvall_HTTP(int fd) {
   string request;
   char buf[1024];
   while (true) {
@@ -116,38 +179,97 @@ string recvall(int fd) {
   }
   return request;
 }
+RecvResult recvall(int fd) {
+  string request;
+  char buf[1024];
+  while (true) {
+    auto len_recv = recv(fd, buf, sizeof(buf), 0);
+    if (len_recv == 0) {
+      return {request, Status::Disconect};
+    }
+    if (len_recv < 0)
+      return {request, Status::Eagain};
+    request.append(buf, len_recv);
+    // if (request.find("\r\n") != string::npos) {
+    //   break;
+    // }
+  }
+  return {request, Status::Ok};
+}
+size_t sendall(int fd, const string &request, size_t total_bytes) {
+  auto bytes_left = request.size() - total_bytes;
+  int n;
+  while (total_bytes < request.size()) {
+    n = send(fd, request.c_str() + total_bytes, bytes_left, MSG_NOSIGNAL);
+    if (n == -1)
+      break;
+    total_bytes += n;
+    bytes_left -= n;
+    cout << total_bytes << endl;
+  }
+  return bytes_left;
+}
+
+atomic<bool> running{true};
+void signal_handler(int sig) { running = false; }
 
 int main() {
-  TCP *tcp_host = new TCP(PORT, true, true);
+  signal(SIGINT, signal_handler);
+  signal(SIGTERM, signal_handler);
+
+  TCP *tcp_host = new TCP("3490", true, true);
   tcp_host->bind();
   listen(tcp_host->get_socket(), 10);
-  socklen_t client_addr_size = sizeof tcp_host->their_addr;
-  auto client_fd =
-      accept(tcp_host->get_socket(), (struct sockaddr *)&tcp_host->their_addr,
-             &client_addr_size);
-  cout << "Контакт есть" << endl;
-  string request = recvall(client_fd);
-  cout << "Данные получены " << request << endl;
+  auto client_fd = tcp_host->get_fd(true);
 
-  TCP *tcp_client = new TCP("80", true, false, "webhook.site");
-  tcp_client->connect();
-  if (send(tcp_client->get_socket(), request.c_str(), request.size(), 0) ==
-      -1) {
-    cerr << "send erorr: " << strerror(errno) << endl;
+  epoll_manage *em = new epoll_manage();
+  int ep_fd = em->epoll_create();
+  auto ep_ev = em->epoll_ev;
+  em->epoll_add_read(client_fd);
+
+  string request = "";
+  size_t remain_bytes = 0;
+  cout << "Начинаю цикл" << endl;
+  while (running) {
+    int nfds = epoll_wait(ep_fd, ep_ev, 65, -1);
+
+    if (nfds == -1) {
+      if (errno == EINTR)
+        continue;
+      cerr << "epoll_wait error: " << strerror(errno) << endl;
+      break;
+    }
+
+    for (int i = 0; i < nfds; i++) {
+      int fd = ep_ev[i].data.fd;
+      uint32_t revents = ep_ev[i].events;
+
+      if (revents & EPOLLIN) {
+        auto [request, status] = recvall(fd);
+        cout << "Принял данные: " << request << endl;
+
+        if (!request.empty()) {
+          if (remain_bytes = sendall(fd, request, 0); remain_bytes > 0) {
+            em->epoll_enable_write(fd);
+          }
+        }
+        if (status == Status::Disconect) {
+          cout << "Клиент отключился." << endl << endl;
+          ;
+          em->epoll_remove(client_fd);
+          close(fd);
+          continue;
+        }
+      }
+
+      if (revents & EPOLLOUT) {
+        cout << "Доотправляю даннные: " << request << endl;
+        remain_bytes = sendall(fd, request, remain_bytes);
+        if (remain_bytes == 0) {
+          request.clear();
+          em->epoll_disable_write(fd);
+        }
+      }
+    }
   }
-  cout << "Данные отправлены" << endl;
-
-  char res_buf[1024];
-  ssize_t byres_read;
-  while ((byres_read = (recv(tcp_client->get_socket(), res_buf,
-                             sizeof(res_buf) - 1, 0)))) {
-    res_buf[byres_read] = '\0';
-    cout << res_buf << endl;
-
-    if (send(client_fd, res_buf, byres_read, 0) == -1) {
-      cerr << "send to console error: " << strerror(errno) << endl;
-    };
-  }
-
-  close(client_fd);
 }

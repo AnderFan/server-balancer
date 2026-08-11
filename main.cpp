@@ -11,16 +11,19 @@
 #include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <ostream>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <system_error>
 #include <unistd.h>
+#include <variant>
+
 #define PORT "8080"
 
 using namespace std;
-// using UniqueAddrInfo = unique_ptr<addrinfo, decltype([](addrinfo *p) {
+// using UniqueAddrInfo = unique_ptr<addrinfo, decltype([](addrinfo *){
 //                                      if (p)
 //                                        freeaddrinfo(p);
 //                                    })>;
@@ -57,6 +60,16 @@ public:
   [[nodiscard]] int get() const noexcept { return socketfd; }
 };
 
+enum class Status { Ok, Disconect, Error, Eagain };
+
+struct StringResult {
+  string result;
+  Status status;
+};
+struct DataResult {
+  int data;
+  Status status;
+};
 class TCP {
 private:
   struct addrinfo hints;
@@ -101,13 +114,21 @@ public:
   }
   int get_socket() { return sockfd->get(); }
 
-  int get_fd(bool non_block) {
+  DataResult accept_fd(bool non_block) {
     socklen_t client_addr_size = sizeof their_addr;
     auto client_fd =
         accept(get_socket(), (struct sockaddr *)&their_addr, &client_addr_size);
+
+    if (client_fd == -1) {
+      if (errno == EAGAIN) {
+        return {client_fd, Status::Eagain};
+      }
+      return {client_fd, Status::Error};
+    }
     if (non_block)
       fcntl(client_fd, F_SETFL, O_NONBLOCK);
-    return client_fd;
+
+    return {client_fd, Status::Ok};
   }
 };
 
@@ -154,45 +175,25 @@ public:
   }
 };
 
-enum class Status { Ok, Disconect, Eagain };
-
-struct RecvResult {
-  string result;
-  Status status;
-};
-
-string recvall_HTTP(int fd) {
-  string request;
-  char buf[1024];
-  while (true) {
-    ssize_t rec = recv(fd, buf, sizeof(buf) - 1, 0);
-    if (rec <= 0) {
-      break;
-    }
-
-    buf[rec] = '\0';
-    request.append(buf, rec);
-
-    if (request.find("\r\n\r\n") != string::npos) {
-      break;
-    }
-  }
-  return request;
-}
-RecvResult recvall(int fd) {
+StringResult recvall(int fd) {
   string request;
   char buf[1024];
   while (true) {
     auto len_recv = recv(fd, buf, sizeof(buf), 0);
+
     if (len_recv == 0) {
       return {request, Status::Disconect};
     }
-    if (len_recv < 0)
-      return {request, Status::Eagain};
+    if (len_recv < 0) {
+      if (errno == EAGAIN) {
+        return {request, Status::Ok};
+      }
+      cerr << "recvall error: " << strerror(errno) << endl;
+      return {request, Status::Error};
+    }
+
     request.append(buf, len_recv);
-    // if (request.find("\r\n") != string::npos) {
-    //   break;
-    // }
+    cout << request << endl;
   }
   return {request, Status::Ok};
 }
@@ -220,19 +221,19 @@ int main() {
   TCP *tcp_host = new TCP("3490", true, true);
   tcp_host->bind();
   listen(tcp_host->get_socket(), 10);
-  auto client_fd = tcp_host->get_fd(true);
-
+  if (fcntl(tcp_host->get_socket(), F_SETFL, O_NONBLOCK) == -1) {
+    cerr << "fctntl tcp_host error: " << strerror(errno) << endl;
+  }
   epoll_manage *em = new epoll_manage();
   int ep_fd = em->epoll_create();
   auto ep_ev = em->epoll_ev;
-  em->epoll_add_read(client_fd);
+  em->epoll_add_read(tcp_host->get_socket());
 
   string request = "";
   size_t remain_bytes = 0;
   cout << "Начинаю цикл" << endl;
   while (running) {
     int nfds = epoll_wait(ep_fd, ep_ev, 65, -1);
-
     if (nfds == -1) {
       if (errno == EINTR)
         continue;
@@ -244,10 +245,24 @@ int main() {
       int fd = ep_ev[i].data.fd;
       uint32_t revents = ep_ev[i].events;
 
+      if (fd == tcp_host->get_socket()) {
+        while (true) {
+          auto [client_fd, status] = tcp_host->accept_fd(true);
+          if (status != Status::Ok) {
+            if (status == Status::Eagain) {
+              break;
+            } else
+              cerr << "accept_fd error: " << strerror(errno) << endl;
+            break;
+          }
+          em->epoll_add_read(client_fd);
+        }
+        continue;
+      }
       if (revents & EPOLLIN) {
         auto [request, status] = recvall(fd);
-        cout << "Принял данные: " << request << endl;
 
+        cout << "Принял данные: " << request << endl;
         if (!request.empty()) {
           if (remain_bytes = sendall(fd, request, 0); remain_bytes > 0) {
             em->epoll_enable_write(fd);
@@ -255,8 +270,7 @@ int main() {
         }
         if (status == Status::Disconect) {
           cout << "Клиент отключился." << endl << endl;
-          ;
-          em->epoll_remove(client_fd);
+          em->epoll_remove(fd);
           close(fd);
           continue;
         }

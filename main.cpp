@@ -1,237 +1,50 @@
+#include "network.hpp"
+#include <algorithm>
 #include <asm-generic/socket.h>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <expected>
+#include <deque>
 #include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <optional>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <system_error>
 #include <unistd.h>
-#include <variant>
+#include <unordered_map>
+#include <vector>
 
 #define PORT "8080"
 
 using namespace std;
-// using UniqueAddrInfo = unique_ptr<addrinfo, decltype([](addrinfo *){
-//                                      if (p)
-//                                        freeaddrinfo(p);
-//                                    })>;
-class Socket {
-private:
-  int socketfd = -1;
-
-public:
-  Socket(addrinfo *res) {
-    socketfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  }
-  ~Socket() {
-    if (socketfd >= 0)
-      close(socketfd);
-  }
-
-  Socket(const Socket &) = delete;
-  Socket &operator=(const Socket &) = delete;
-
-  Socket(Socket &&other) noexcept : socketfd(other.socketfd) {
-    other.socketfd = -1;
-  }
-
-  Socket &operator=(Socket &&other) noexcept {
-    if (this != &other) {
-      if (socketfd >= 0)
-        close(socketfd);
-      socketfd = other.socketfd;
-      other.socketfd = -1;
-    }
-    return *this;
-  }
-
-  [[nodiscard]] int get() const noexcept { return socketfd; }
-};
-
-enum class Status { Ok, Disconect, Error, Eagain };
-
-struct StringResult {
-  string result;
-  Status status;
-};
-struct DataResult {
-  int data;
-  Status status;
-};
-class TCP {
-private:
-  struct addrinfo hints;
-  struct addrinfo *res = nullptr;
-  Socket *sockfd = nullptr;
-
-public:
-  struct sockaddr_storage their_addr;
-  TCP(const char *port, bool opt, bool host = false,
-      const char *adress = NULL) {
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (host)
-      hints.ai_flags = AI_PASSIVE;
-
-    if (auto status = getaddrinfo(adress, port, &hints, &res); status != 0) {
-      std::cerr << "getaddrinfo error: " << gai_strerror(status) << '\n';
-      return;
-    }
-    // UniqueAddrInfo res(raw_res);
-    sockfd = new Socket(res);
-
-    if (opt) {
-      int yes = 1;
-      if (::setsockopt(sockfd->get(), SOL_SOCKET, SO_REUSEADDR,
-                       reinterpret_cast<const void *>(&yes),
-                       static_cast<socklen_t>(sizeof(yes))) < 0) {
-        cerr << "setsockopt error: " << strerror(errno) << '\n';
-      }
-    }
-  }
-  void bind() {
-    if (::bind(sockfd->get(), res->ai_addr, res->ai_addrlen) != 0) {
-      cerr << "bind error: " << strerror(errno) << '\n';
-    }
-  }
-  void connect() {
-    if (::connect(sockfd->get(), res->ai_addr, res->ai_addrlen) == -1) {
-      cerr << "connect error: " << strerror(errno) << '\n';
-    }
-  }
-  int get_socket() { return sockfd->get(); }
-
-  DataResult accept_fd(bool non_block) {
-    socklen_t client_addr_size = sizeof their_addr;
-    auto client_fd =
-        accept(get_socket(), (struct sockaddr *)&their_addr, &client_addr_size);
-
-    if (client_fd == -1) {
-      if (errno == EAGAIN) {
-        return {client_fd, Status::Eagain};
-      }
-      return {client_fd, Status::Error};
-    }
-    if (non_block)
-      fcntl(client_fd, F_SETFL, O_NONBLOCK);
-
-    return {client_fd, Status::Ok};
-  }
-};
-
-class epoll_manage {
-private:
-  int epoll_fd;
-
-  bool modify_epoll_event(int epoll_fd, int client_fd, uint32_t events,
-                          int op = EPOLL_CTL_MOD) {
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.events = events | EPOLLET;
-    ev.data.fd = client_fd;
-
-    if (epoll_ctl(epoll_fd, op, client_fd, &ev) == -1) {
-      cerr << "epoll_ctl error: " << strerror(errno) << endl;
-      return false;
-    }
-    return true;
-  }
-
-public:
-  epoll_event epoll_ev[65];
-  int epoll_create() {
-    epoll_fd = ::epoll_create(69);
-    if (epoll_fd == -1) {
-      cerr << "epoll_create error: " << strerror(errno) << endl;
-    }
-    return epoll_fd;
-  }
-
-  inline bool epoll_add_read(int client_fd) {
-    return modify_epoll_event(epoll_fd, client_fd, EPOLLIN, EPOLL_CTL_ADD);
-  }
-  inline bool epoll_enable_write(int client_fd) {
-    return modify_epoll_event(epoll_fd, client_fd, EPOLLIN | EPOLLOUT,
-                              EPOLL_CTL_MOD);
-  }
-  inline bool epoll_disable_write(int client_fd) {
-    return modify_epoll_event(epoll_fd, client_fd, EPOLLIN, EPOLL_CTL_MOD);
-  }
-  inline bool epoll_remove(int client_fd) {
-    return epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr) == 0;
-  }
-};
-
-StringResult recvall(int fd) {
-  string request;
-  char buf[1024];
-  while (true) {
-    auto len_recv = recv(fd, buf, sizeof(buf), 0);
-
-    if (len_recv == 0) {
-      return {request, Status::Disconect};
-    }
-    if (len_recv < 0) {
-      if (errno == EAGAIN) {
-        return {request, Status::Ok};
-      }
-      cerr << "recvall error: " << strerror(errno) << endl;
-      return {request, Status::Error};
-    }
-
-    request.append(buf, len_recv);
-    cout << request << endl;
-  }
-  return {request, Status::Ok};
-}
-size_t sendall(int fd, const string &request, size_t total_bytes) {
-  auto bytes_left = request.size() - total_bytes;
-  int n;
-  while (total_bytes < request.size()) {
-    n = send(fd, request.c_str() + total_bytes, bytes_left, MSG_NOSIGNAL);
-    if (n == -1)
-      break;
-    total_bytes += n;
-    bytes_left -= n;
-    cout << total_bytes << endl;
-  }
-  return bytes_left;
-}
 
 atomic<bool> running{true};
 void signal_handler(int sig) { running = false; }
 
-int main() {
-  signal(SIGINT, signal_handler);
-  signal(SIGTERM, signal_handler);
+void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
+  int ep_fd = epoll.epoll_create();
+  auto ep_ev = epoll.epoll_ev;
 
-  TCP *tcp_host = new TCP("3490", true, true);
-  tcp_host->bind();
-  listen(tcp_host->get_socket(), 10);
-  if (fcntl(tcp_host->get_socket(), F_SETFL, O_NONBLOCK) == -1) {
-    cerr << "fctntl tcp_host error: " << strerror(errno) << endl;
-  }
-  epoll_manage *em = new epoll_manage();
-  int ep_fd = em->epoll_create();
-  auto ep_ev = em->epoll_ev;
-  em->epoll_add_read(tcp_host->get_socket());
+  int server_fd = server.get_fd();
+  epoll.epoll_add_read(server_fd);
 
-  string request = "";
-  size_t remain_bytes = 0;
-  cout << "Начинаю цикл" << endl;
+  int host_fd = remoute_host.get_fd();
+  epoll.epoll_add_read(host_fd);
+
+  unordered_map<int, ClientSession> active_clients;
+  deque<SendData> queue_to_send_remoute;
+  vector<SendData> queue_to_send_client;
   while (running) {
     int nfds = epoll_wait(ep_fd, ep_ev, 65, -1);
     if (nfds == -1) {
@@ -245,45 +58,113 @@ int main() {
       int fd = ep_ev[i].data.fd;
       uint32_t revents = ep_ev[i].events;
 
-      if (fd == tcp_host->get_socket()) {
+      if (fd == server_fd && fd != host_fd) {
         while (true) {
-          auto [client_fd, status] = tcp_host->accept_fd(true);
+          auto [client_fd, status] = server.accept_fd(true);
           if (status != Status::Ok) {
             if (status == Status::Eagain) {
               break;
-            } else
+            } else {
               cerr << "accept_fd error: " << strerror(errno) << endl;
+            }
             break;
           }
-          em->epoll_add_read(client_fd);
+          active_clients[client_fd] = ClientSession{.fd = client_fd};
+          epoll.epoll_add_read(client_fd);
         }
         continue;
       }
-      if (revents & EPOLLIN) {
-        auto [request, status] = recvall(fd);
 
-        cout << "Принял данные: " << request << endl;
-        if (!request.empty()) {
-          if (remain_bytes = sendall(fd, request, 0); remain_bytes > 0) {
-            em->epoll_enable_write(fd);
+      auto &client = active_clients[fd];
+
+      if (revents & EPOLLIN) {
+        auto [request, status] = recvall(fd, false);
+
+        if (fd != host_fd) {
+          client.read_buffer = request;
+
+          cout << "Принял данные от клиента: " << request << endl;
+          if (!request.empty()) {
+            queue_to_send_remoute.push_back({::move(client.read_buffer), fd});
+            epoll.epoll_enable_write(host_fd);
+          }
+          for (auto a : queue_to_send_remoute) {
+            cout << a.fd << " " << a.str << endl;
+          }
+          if (status == Status::Disconect) {
+            cout << "Клиент отключился." << endl << endl;
+            epoll.epoll_remove(fd);
+            std::erase_if(queue_to_send_remoute,
+                          [fd](const SendData &item) { return item.fd == fd; });
+            close(fd);
+            continue;
           }
         }
-        if (status == Status::Disconect) {
-          cout << "Клиент отключился." << endl << endl;
-          em->epoll_remove(fd);
-          close(fd);
-          continue;
+        if (fd == host_fd) {
+          auto [bufer, c_fd] = parse_string(request);
+          active_clients[c_fd].write_buffer = bufer;
         }
       }
 
       if (revents & EPOLLOUT) {
-        cout << "Доотправляю даннные: " << request << endl;
-        remain_bytes = sendall(fd, request, remain_bytes);
-        if (remain_bytes == 0) {
-          request.clear();
-          em->epoll_disable_write(fd);
+
+        if (fd == host_fd) {
+          cout << "Отправлюя данные на сервер" << endl;
+          while (!queue_to_send_remoute.empty()) {
+            auto &client = queue_to_send_remoute.front();
+
+            string bufer = to_string(client.fd) + ":" + client.str + "\n";
+
+            auto status = sendall(host_fd, bufer);
+            if (status == Status::Error) {
+              cerr << "sendall error: " << strerror(errno) << endl;
+            }
+            if (status == Status::Eagain) {
+              break;
+              cout << "Буфер полный. Ждём" << endl;
+            }
+            queue_to_send_remoute.pop_front();
+          }
+          if (queue_to_send_remoute.empty()) {
+            cout << "Всё отпрвили" << endl;
+            epoll.epoll_disable_write(host_fd);
+          }
+        }
+        if (fd != host_fd) {
+          auto status = sendall(fd, client.write_buffer);
+          if (status == Status::Error) {
+            cerr << "sendall error: " << strerror(errno) << endl;
+          }
+          if (client.bytes_left == 0) {
+            client.write_buffer.clear();
+            epoll.epoll_disable_write(fd);
+          }
         }
       }
     }
+  }
+}
+
+int main() {
+  signal(SIGINT, signal_handler);
+  signal(SIGTERM, signal_handler);
+
+  auto remoute_host =
+      TCPserver::create_tcp("127.127.1.1", "3491", SocketMode::Connector);
+  if (remoute_host == nullopt) {
+    cerr << "Не удалось подключиться к серверу" << endl;
+    return 1;
+  }
+  if (auto server = TCPserver::create_tcp(NULL, "3490", SocketMode::Listener)) {
+
+    if (fcntl(server->get_fd(), F_SETFL, O_NONBLOCK) == -1) {
+      cerr << "fctntl tcp_host error: " << strerror(errno) << endl;
+    }
+    EpollManage epoll;
+    cout << "Начинаю цикл" << endl;
+
+    eventloop(*server, epoll, *remoute_host);
+  } else {
+    return 1;
   }
 }

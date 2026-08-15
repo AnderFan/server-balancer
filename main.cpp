@@ -78,11 +78,12 @@ void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
       auto &client = active_clients[fd];
 
       if (revents & EPOLLIN) {
-        auto [request, status] = recvall(fd, false);
-
+        auto [request, status] = recvall(fd);
+        if (request.size() >= 2) { // Убираем \n
+          request.erase(request.size() - 2);
+        }
         if (fd != host_fd) {
           client.read_buffer = request;
-
           cout << "Принял данные от клиента: " << request << endl;
           if (!request.empty()) {
             queue_to_send_remoute.push_back({::move(client.read_buffer), fd});
@@ -103,6 +104,7 @@ void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
         if (fd == host_fd) {
           auto [bufer, c_fd] = parse_string(request);
           active_clients[c_fd].write_buffer = bufer;
+          epoll.epoll_enable_write(c_fd);
         }
       }
 
@@ -126,7 +128,7 @@ void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
             queue_to_send_remoute.pop_front();
           }
           if (queue_to_send_remoute.empty()) {
-            cout << "Всё отпрвили" << endl;
+            cout << "Всё отправили" << endl;
             epoll.epoll_disable_write(host_fd);
           }
         }
@@ -135,7 +137,8 @@ void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
           if (status == Status::Error) {
             cerr << "sendall error: " << strerror(errno) << endl;
           }
-          if (client.bytes_left == 0) {
+          if (client.write_buffer.empty()) {
+            cout << "Отправил капибару" << endl;
             client.write_buffer.clear();
             epoll.epoll_disable_write(fd);
           }
@@ -151,6 +154,7 @@ int main() {
 
   auto remoute_host =
       TCPserver::create_tcp("127.127.1.1", "3491", SocketMode::Connector);
+  fcntl(remoute_host->get_fd(), F_SETFL, O_NONBLOCK);
   if (remoute_host == nullopt) {
     cerr << "Не удалось подключиться к серверу" << endl;
     return 1;

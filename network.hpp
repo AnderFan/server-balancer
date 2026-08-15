@@ -203,7 +203,7 @@ public:
   }
 };
 
-inline StringResult recvall(int fd, bool del) {
+inline StringResult recvall(int fd) {
   std::string request;
   char buf[1024];
   while (true) {
@@ -216,38 +216,37 @@ inline StringResult recvall(int fd, bool del) {
       return {request, Status::Error};
     }
     request.append(buf, len_recv);
-    if (del == true && request.find("\n") != std::string::npos) {
+    if (request.find("\n") != std::string::npos) {
       return {request, Status::Ok};
     }
   }
 }
 inline Status sendall(int fd, std::string &request) {
-  auto n = ::send(fd, request.c_str(), request.length(), 0);
-  if (n > 0) {
-    request.erase(0, n);
-  } else {
-    if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      return Status::Eagain;
+  while (!request.empty()) {
+    auto n = ::send(fd, request.c_str(), request.length(), MSG_NOSIGNAL);
+    if (n > 0) {
+      request.erase(0, n);
+    } else {
+      if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return Status::Eagain;
+      }
+      return Status::Error;
     }
-    return Status::Error;
   }
-
-  if (request.empty()) {
-    return Status::Ok;
-  }
-  return Status::Error;
+  return Status::Ok;
 }
-
 inline SendData parse_string(std::string str) {
   std::string_view sv = str;
   size_t delim_pos = sv.find(":");
   if (delim_pos == std::string_view::npos) {
     std::cerr << "Неверная упаковка: " + str << std::endl;
+    return {"-", -1};
   }
   int fd = 0;
   auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + delim_pos, fd);
   if (ec != std::errc{} || ptr != sv.data() + delim_pos) {
     std::cerr << "Неверная упаковка: " + str << std::endl;
+    return {"-", -1};
   }
   std::string_view text = sv.substr(delim_pos + 1);
   if (!text.empty() && text.back() == '\n') {

@@ -33,28 +33,25 @@ void eventloop(TCPserver &server) {
     }
     cout << "Коннект есть!" << endl;
     for (;;) {
-      auto [request, status_revcall] = recvall(proxy_fd, true);
-
+      auto [request, status_revcall] = recvall(proxy_fd);
+      if (status_revcall == Status::Disconect) {
+        close(proxy_fd);
+        break;
+      }
       SendData data = parse_string(request);
 
       if (status_revcall == Status::Error) {
         cerr << "recvall error :" << strerror(errno) << endl;
       }
-      request += "_Capybara";
-      string bufer = to_string(data.fd) + request + "\n";
+      string bufer = to_string(data.fd) + ":" + data.str + "_Capybara" + "\n";
       cout << request << endl;
       while (true) {
-        auto status_sendall = sendall(proxy_fd, request);
+        auto status_sendall = sendall(proxy_fd, bufer);
         if (status_sendall == Status::Error) {
           cerr << "sendall error: " << strerror(errno) << endl;
           return;
         }
         cout << "Отправил данные" << endl;
-        if (status_sendall == Status::Ok)
-          break;
-      }
-      if (status_revcall == Status::Disconect) {
-        close(proxy_fd);
         break;
       }
     }

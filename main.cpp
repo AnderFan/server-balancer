@@ -1,9 +1,7 @@
 #include "network.hpp"
-#include <algorithm>
 #include <asm-generic/socket.h>
 #include <atomic>
 #include <cerrno>
-#include <charconv>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -17,7 +15,6 @@
 #include <optional>
 #include <ostream>
 #include <string>
-#include <string_view>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -29,22 +26,30 @@
 
 using namespace std;
 
+Socket create_tcp_upstream() {
+  auto upstream =
+      TCPserver::create_tcp("127.127.1.1", "3491", SocketMode::Connector, true);
+  if (!upstream) {
+    cerr << "Не удалось создать tcp upstream";
+  }
+  return upstream->get_socket();
+}
+
 atomic<bool> running{true};
 void signal_handler(int sig) { running = false; }
 
-void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
+void eventloop(TCPserver &server, EpollManage &epoll) {
   int ep_fd = epoll.epoll_create();
+
   auto ep_ev = epoll.epoll_ev;
 
-  int server_fd = server.get_fd();
-  epoll.epoll_add_read(server_fd);
+  Connection listener_conn{.socket = server.get_socket(), .peer = nullptr};
 
-  int host_fd = remoute_host.get_fd();
-  epoll.epoll_add_read(host_fd);
-
+  epoll.epoll_add_read(&listener_conn);
+  std::unordered_map<int, std::unique_ptr<Session>> sessions;
   unordered_map<int, ClientSession> active_clients;
-  deque<SendData> queue_to_send_remoute;
-  vector<SendData> queue_to_send_client;
+
+  vector<int> erase_list;
   while (running) {
     int nfds = epoll_wait(ep_fd, ep_ev, 65, -1);
     if (nfds == -1) {
@@ -55,12 +60,16 @@ void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
     }
 
     for (int i = 0; i < nfds; i++) {
-      int fd = ep_ev[i].data.fd;
+      auto *conn = static_cast<Connection *>(ep_ev[i].data.ptr);
       uint32_t revents = ep_ev[i].events;
 
-      if (fd == server_fd && fd != host_fd) {
+      if (conn->socket.get() == -1) {
+        continue;
+      }
+
+      if (conn->peer == nullptr) {
         while (true) {
-          auto [client_fd, status] = server.accept_fd(true);
+          auto [client, status] = accept_fd(conn->socket.get(), true);
           if (status != Status::Ok) {
             if (status == Status::Eagain) {
               break;
@@ -69,82 +78,61 @@ void eventloop(TCPserver &server, EpollManage &epoll, TCPserver &remoute_host) {
             }
             break;
           }
-          active_clients[client_fd] = ClientSession{.fd = client_fd};
-          epoll.epoll_add_read(client_fd);
+          auto client_fd = client.get();
+
+          auto upstream = create_tcp_upstream();
+          cout << "upstream " << upstream.get() << endl;
+          auto session = std::make_unique<Session>();
+          session->client.socket = std::move(client);
+          session->upstream.socket = std::move(upstream);
+
+          epoll.epoll_add_read(&session->client);
+          epoll.epoll_add_read(&session->upstream);
+          cout << "client_fd " << client_fd << endl;
+          sessions[client_fd] = move(session);
+          cout << client_fd << endl;
         }
         continue;
-      }
-
-      auto &client = active_clients[fd];
-
-      if (revents & EPOLLIN) {
-        auto [request, status] = recvall(fd);
-        if (request.size() >= 2) { // Убираем \n
-          request.erase(request.size() - 2);
-        }
-        if (fd != host_fd) {
-          client.read_buffer = request;
-          cout << "Принял данные от клиента: " << request << endl;
+      } else {
+        if (revents & EPOLLIN) {
+          auto [request, status] = recvall(conn->socket.get());
           if (!request.empty()) {
-            queue_to_send_remoute.push_back({::move(client.read_buffer), fd});
-            epoll.epoll_enable_write(host_fd);
-          }
-          for (auto a : queue_to_send_remoute) {
-            cout << a.fd << " " << a.str << endl;
+            conn->peer->out_buffer = request;
+            cout << "Записано " << conn->peer->out_buffer << endl;
+            epoll.epoll_enable_write(conn->peer);
           }
           if (status == Status::Disconect) {
-            cout << "Клиент отключился." << endl << endl;
-            epoll.epoll_remove(fd);
-            std::erase_if(queue_to_send_remoute,
-                          [fd](const SendData &item) { return item.fd == fd; });
-            close(fd);
-            continue;
+            cout << "ЗАКРЫВАЕМ ВСЁ НАХУЙ" << conn->socket.get() << endl;
+            auto client_fd = conn->socket.get();
+            epoll.epoll_remove(conn);
+            if (conn->peer)
+              epoll.epoll_remove(conn->peer);
+
+            conn->socket = Socket(-1);
+            if (conn->peer)
+              conn->peer->socket = Socket(-1);
+
+            erase_list.push_back(client_fd);
           }
-        }
-        if (fd == host_fd) {
-          auto [bufer, c_fd] = parse_string(request);
-          active_clients[c_fd].write_buffer = bufer;
-          epoll.epoll_enable_write(c_fd);
+          continue;
         }
       }
-
       if (revents & EPOLLOUT) {
-
-        if (fd == host_fd) {
-          cout << "Отправлюя данные на сервер" << endl;
-          while (!queue_to_send_remoute.empty()) {
-            auto &client = queue_to_send_remoute.front();
-
-            string bufer = to_string(client.fd) + ":" + client.str + "\n";
-
-            auto status = sendall(host_fd, bufer);
-            if (status == Status::Error) {
-              cerr << "sendall error: " << strerror(errno) << endl;
-            }
-            if (status == Status::Eagain) {
-              break;
-              cout << "Буфер полный. Ждём" << endl;
-            }
-            queue_to_send_remoute.pop_front();
-          }
-          if (queue_to_send_remoute.empty()) {
-            cout << "Всё отправили" << endl;
-            epoll.epoll_disable_write(host_fd);
-          }
+        auto status = sendall(conn->socket.get(), conn->out_buffer);
+        if (status == Status::Error) {
+          cerr << "sendall error: " << strerror(errno) << endl;
         }
-        if (fd != host_fd) {
-          auto status = sendall(fd, client.write_buffer);
-          if (status == Status::Error) {
-            cerr << "sendall error: " << strerror(errno) << endl;
-          }
-          if (client.write_buffer.empty()) {
-            cout << "Отправил капибару" << endl;
-            client.write_buffer.clear();
-            epoll.epoll_disable_write(fd);
-          }
+        if (conn->out_buffer.empty()) {
+          cout << "Отправил" << endl;
+          conn->out_buffer.clear();
+          epoll.epoll_disable_write(conn);
         }
       }
     }
+    for (int key : erase_list) {
+      sessions.erase(key);
+    }
+    erase_list.clear();
   }
 }
 
@@ -152,22 +140,13 @@ int main() {
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
 
-  auto remoute_host =
-      TCPserver::create_tcp("127.127.1.1", "3491", SocketMode::Connector);
-  fcntl(remoute_host->get_fd(), F_SETFL, O_NONBLOCK);
-  if (remoute_host == nullopt) {
-    cerr << "Не удалось подключиться к серверу" << endl;
-    return 1;
-  }
-  if (auto server = TCPserver::create_tcp(NULL, "3490", SocketMode::Listener)) {
+  if (auto server =
+          TCPserver::create_tcp(NULL, "3490", SocketMode::Listener, true)) {
 
-    if (fcntl(server->get_fd(), F_SETFL, O_NONBLOCK) == -1) {
-      cerr << "fctntl tcp_host error: " << strerror(errno) << endl;
-    }
     EpollManage epoll;
     cout << "Начинаю цикл" << endl;
 
-    eventloop(*server, epoll, *remoute_host);
+    eventloop(*server, epoll);
   } else {
     return 1;
   }

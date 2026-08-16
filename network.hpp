@@ -25,18 +25,6 @@ struct StringResult {
   std::string result;
   Status status;
 };
-struct DataResult {
-  int data;
-  Status status;
-};
-
-struct ClientSession {
-  int fd = -1;
-  std::string write_buffer;
-  std::string read_buffer;
-  std::size_t bytes_left = 0;
-};
-
 struct AddrInfoDeleter {
   void operator()(addrinfo *p) const noexcept {
     if (p != nullptr)
@@ -76,6 +64,36 @@ public:
 
   [[nodiscard]] int get() const noexcept { return socketfd; }
 };
+enum class TcpRole { Client, Upstream, Listener };
+
+struct Session;
+
+struct Connection {
+  Socket socket;
+  Connection *peer;
+  std::string out_buffer;
+};
+
+struct Session {
+  Connection client;
+  Connection upstream;
+  Session() {
+    client.peer = &upstream;
+    upstream.peer = &client;
+  }
+};
+
+struct DataResult {
+  Socket socket;
+  Status status;
+};
+
+struct ClientSession {
+  Socket client;
+  Socket upstream;
+  std::string write_buffer;
+  std::string read_buffer;
+};
 
 enum class SocketMode { Listener, Connector };
 
@@ -86,8 +104,9 @@ private:
       : listener_fd(std::move(socket)) {}
 
 public:
-  static std::optional<TCPserver>
-  create_tcp(const char *adress, const char *port, SocketMode mode) {
+  static std::optional<TCPserver> create_tcp(const char *adress,
+                                             const char *port, SocketMode mode,
+                                             bool nonblock) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -123,38 +142,28 @@ public:
       if (connect(sock.get(), res->ai_addr, res->ai_addrlen) == -1)
         return std::nullopt;
     }
+
+    if (nonblock) {
+      fcntl(sock.get(), F_SETFL, O_NONBLOCK);
+    }
     return TCPserver(std::move(sock));
   }
 
   [[nodiscard]] int get_fd() const noexcept { return listener_fd.get(); }
-
-  DataResult accept_fd(bool non_block) {
-    sockaddr_storage their_addr{};
-    socklen_t their_addr_size = sizeof(their_addr);
-    auto client_fd = ::accept(
-        get_fd(), reinterpret_cast<sockaddr *>(&their_addr), &their_addr_size);
-
-    if (client_fd == -1) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return {client_fd, Status::Eagain};
-      return {client_fd, Status::Error};
-    }
-    if (non_block)
-      ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
-
-    return {client_fd, Status::Ok};
-  }
+  Socket get_socket() { return std::move(listener_fd); }
 };
+
+struct Connection;
 
 class EpollManage {
 private:
   int epoll_fd = -1;
 
-  bool modify_epoll_event(int client_fd, uint32_t events, int op) {
+  bool modify_epoll_event(Connection *client, uint32_t events, int op) {
     epoll_event ev{};
     ev.events = events | EPOLLET;
-    ev.data.fd = client_fd;
-    return ::epoll_ctl(epoll_fd, op, client_fd, &ev) == 0;
+    ev.data.ptr = client;
+    return ::epoll_ctl(epoll_fd, op, client->socket.get(), &ev) == 0;
   }
 
 public:
@@ -186,20 +195,21 @@ public:
     return epoll_fd;
   }
 
-  bool epoll_add_write(int client_fd) {
-    return modify_epoll_event(client_fd, EPOLLOUT, EPOLL_CTL_ADD);
+  bool epoll_add_write(Connection *client) {
+    return modify_epoll_event(client, EPOLLOUT, EPOLL_CTL_ADD);
   }
-  bool epoll_add_read(int client_fd) {
-    return modify_epoll_event(client_fd, EPOLLIN, EPOLL_CTL_ADD);
+  bool epoll_add_read(Connection *client) {
+    return modify_epoll_event(client, EPOLLIN, EPOLL_CTL_ADD);
   }
-  bool epoll_enable_write(int client_fd) {
-    return modify_epoll_event(client_fd, EPOLLIN | EPOLLOUT, EPOLL_CTL_MOD);
+  bool epoll_enable_write(Connection *client) {
+    return modify_epoll_event(client, EPOLLIN | EPOLLOUT, EPOLL_CTL_MOD);
   }
-  bool epoll_disable_write(int client_fd) {
-    return modify_epoll_event(client_fd, EPOLLIN, EPOLL_CTL_MOD);
+  bool epoll_disable_write(Connection *client) {
+    return modify_epoll_event(client, EPOLLIN, EPOLL_CTL_MOD);
   }
-  bool epoll_remove(int client_fd) {
-    return ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr) == 0;
+  bool epoll_remove(Connection *client) {
+    return ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->socket.get(),
+                       nullptr) == 0;
   }
 };
 
@@ -213,6 +223,7 @@ inline StringResult recvall(int fd) {
     if (len_recv < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
         return {request, Status::Ok};
+      std::cerr << "Ошибка recvall: " << strerror(errno) << std::endl;
       return {request, Status::Error};
     }
     request.append(buf, len_recv);
@@ -235,6 +246,24 @@ inline Status sendall(int fd, std::string &request) {
   }
   return Status::Ok;
 }
+inline DataResult accept_fd(int fd, bool non_block) {
+  sockaddr_storage their_addr{};
+  socklen_t their_addr_size = sizeof(their_addr);
+  auto client_fd =
+      ::accept(fd, reinterpret_cast<sockaddr *>(&their_addr), &their_addr_size);
+
+  Socket socket(client_fd);
+  if (client_fd == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+      return {std::move(socket), Status::Eagain};
+    return {std::move(socket), Status::Error};
+  }
+  if (non_block)
+    ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
+
+  return {std::move(socket), Status::Ok};
+}
+
 inline SendData parse_string(std::string str) {
   std::string_view sv = str;
   size_t delim_pos = sv.find(":");

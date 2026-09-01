@@ -1,9 +1,9 @@
 #include <asm-generic/socket.h>
 #include <cerrno>
-#include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <optional>
@@ -30,8 +30,9 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
 
   Connection listener_conn{.socket = server.get_socket(), .peer = nullptr};
   epoll.epoll_add_read(&listener_conn);
-  unordered_map<int, Connection> sessions;
+  unordered_map<int, unique_ptr<Connection>> sessions;
 
+  vector<int> erase_list;
   while (true) {
     int nfds = epoll_wait(ep_fd, ep_ev, 65, -1);
     if (nfds == -1) {
@@ -45,7 +46,11 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
       auto *conn = static_cast<Connection *>(ep_ev[i].data.ptr);
       uint32_t revents = ep_ev[i].events;
 
-      if (conn->peer == nullptr) {
+      if (conn->socket.get() == -1) {
+        continue;
+      }
+
+      if (conn == &listener_conn) {
         while (true) {
           auto [client, status] = accept_fd(conn->socket.get(), true);
           if (status != Status::Ok) {
@@ -57,12 +62,12 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
             }
             break;
           }
-          Connection session;
+          auto session = make_unique<Connection>();
           int client_fd = client.get();
-          session.socket = std::move(client);
+          session->socket = std::move(client);
 
+          epoll.epoll_add_read(session.get());
           sessions[client_fd] = move(session);
-          epoll.epoll_add_read(&sessions[client_fd]);
         }
         continue;
       } else {
@@ -78,11 +83,17 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
           }
 
           if (status == Status::Disconect) {
-            cout << "Клиент отключился." << endl << endl;
+            cout << "Клиент отключился. Вырубаю всё" << endl << endl;
+            auto client_fd = conn->socket.get();
             epoll.epoll_remove(conn);
-            close(conn->socket.get());
-            sessions.erase(conn->socket.get());
-            continue;
+            if (conn->peer)
+              epoll.epoll_remove(conn->peer);
+
+            conn->socket = Socket(-1);
+            if (conn->peer)
+              conn->peer->socket = Socket(-1);
+
+            erase_list.push_back(client_fd);
           }
         }
 
@@ -100,11 +111,19 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
         }
       }
     }
+    for (int key : erase_list) {
+      sessions.erase(key);
+    }
+    erase_list.clear();
   }
 }
 
-int main() {
-  if (auto server = TCPserver::create_tcp("127.127.1.1", "3491",
+int main(int argc, char *argv[]) {
+  if (!argv[1]) {
+    cerr << "Non argument id" << endl;
+  }
+  string ip = "127.127.1." + string(argv[1]);
+  if (auto server = TCPserver::create_tcp(ip.c_str(), "3491",
                                           SocketMode::Listener, true)) {
     EpollManage epoll;
     eventloop(*server, epoll);

@@ -1,0 +1,31 @@
+services:
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile.balancer
+    ports:
+      - "3490:3490"
+    command: ["3490", "backend1:3491", "backend2:3491", "backend3:3491"]
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+
+  backend1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["1"]
+
+  backend2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["2"]
+
+  backend3:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["3"]
+

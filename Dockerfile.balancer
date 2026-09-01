@@ -1,0 +1,19 @@
+FROM gcc:14-bookworm AS builder
+
+RUN apt-get update && apt-get install -y cmake ninja-build && rm -rf var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY CMakeLists.txt .
+COPY common/ ./common/
+COPY src/ ./src/
+
+RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build --target load_balancer
+
+FROM debian:bookworm-slim
+WORKDIR /app
+
+COPY --from=builder /build/build/load_balancer /app/load_balancer
+EXPOSE 3490
+
+ENTRYPOINT ["/app/load_balancer"]

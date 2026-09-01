@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -16,6 +17,8 @@
 #include <system_error>
 #include <unistd.h>
 #include <utility>
+#include <vector>
+
 enum class Status { Ok, Disconect, Error, Eagain };
 struct SendData {
   std::string str;
@@ -74,9 +77,20 @@ struct Connection {
   std::string out_buffer;
 };
 
+struct Server {
+  std::string server_ip;
+  int active_connect = 0;
+  int error_count = 0;
+  bool active_server = true;
+};
+
+inline std::vector<Server> server_list{
+    {"backend1"}, {"backend2"}, {"backend3"}};
+
 struct Session {
   Connection client;
   Connection upstream;
+  Server ptr_server;
   Session() {
     client.peer = &upstream;
     upstream.peer = &client;

@@ -1,4 +1,5 @@
 #include "network.hpp"
+#include <algorithm>
 #include <asm-generic/socket.h>
 #include <atomic>
 #include <cerrno>
@@ -6,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fcntl.h>
 #include <iostream>
@@ -14,9 +16,12 @@
 #include <netinet/in.h>
 #include <optional>
 #include <ostream>
+#include <ranges>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -26,30 +31,74 @@
 
 using namespace std;
 
-Socket create_tcp_upstream() {
-  auto upstream =
-      TCPserver::create_tcp("127.127.1.1", "3491", SocketMode::Connector, true);
-  if (!upstream) {
-    cerr << "Не удалось создать tcp upstream";
+optional<Socket> create_tcp_upstream() {
+  optional<TCPserver> upstream;
+  while (true) {
+    auto active_server =
+        server_list | std::views::filter(&Server::active_server);
+    auto it = ranges::min_element(active_server, {}, &Server::active_connect);
+    if (it == ranges::end(active_server)) {
+      cout << "Доступных серверов нет" << endl;
+      return nullopt;
+    }
+    upstream = TCPserver::create_tcp(it->server_ip.c_str(), "3491",
+                                     SocketMode::Connector, true);
+
+    if (!upstream) {
+      cerr << "Не удалось создать tcp upstream";
+      it->error_count++;
+      if (it->error_count >= 2) {
+        cout << "Сервер " + it->server_ip
+             << " перестал выходить на связь. Отключаю" << endl;
+        it->active_server = false;
+      }
+      continue;
+    }
+    it->active_connect++;
+    break;
   }
+
   return upstream->get_socket();
 }
+
+class Timer {
+private:
+  Socket tfd;
+
+public:
+  Timer(int sec_start, int sec_interval) {
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    this->tfd = Socket(fd);
+
+    struct itimerspec ts{};
+    ts.it_value.tv_sec = sec_start;
+    ts.it_interval.tv_sec = sec_interval;
+    timerfd_settime(tfd.get(), 0, &ts, nullptr);
+  }
+  Socket get_socket() { return move(tfd); }
+};
 
 atomic<bool> running{true};
 void signal_handler(int sig) { running = false; }
 
 void eventloop(TCPserver &server, EpollManage &epoll) {
-  int ep_fd = epoll.epoll_create();
 
+  int ep_fd = epoll.epoll_create();
   auto ep_ev = epoll.epoll_ev;
 
-  Connection listener_conn{.socket = server.get_socket(), .peer = nullptr};
+  Connection listener_conn{.socket = server.get_socket(),
+                           .peer =
+                               nullptr}; // Структура для прнимабщего сервера
 
   epoll.epoll_add_read(&listener_conn);
   std::unordered_map<int, std::unique_ptr<Session>> sessions;
   unordered_map<int, ClientSession> active_clients;
 
   vector<int> erase_list;
+
+  auto tfd = Timer(2, 2);
+  Connection timer_conn{.socket = tfd.get_socket(), .peer = nullptr};
+  epoll.epoll_add_read(&timer_conn);
   while (running) {
     int nfds = epoll_wait(ep_fd, ep_ev, 65, -1);
     if (nfds == -1) {
@@ -67,6 +116,21 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
         continue;
       }
 
+      if (conn == &timer_conn) {
+        auto inactive_server =
+            server_list |
+            std::views::filter([](const auto &s) { return !s.active_server; });
+        for (auto &s : inactive_server) {
+          if (auto upstream = TCPserver::create_tcp(
+                  s.server_ip.c_str(), "3491", SocketMode::Connector, true)) {
+            s.active_server = true;
+          }
+        }
+        uint64_t expirations = 0;
+        read(conn->socket.get(), &expirations, sizeof(expirations));
+        continue;
+      }
+
       if (conn->peer == nullptr) {
         while (true) {
           auto [client, status] = accept_fd(conn->socket.get(), true);
@@ -81,10 +145,13 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
           auto client_fd = client.get();
 
           auto upstream = create_tcp_upstream();
-          cout << "upstream " << upstream.get() << endl;
+          if (!upstream) {
+            break;
+          }
+          cout << "upstream " << upstream->get() << endl;
           auto session = std::make_unique<Session>();
           session->client.socket = std::move(client);
-          session->upstream.socket = std::move(upstream);
+          session->upstream.socket = std::move(*upstream);
 
           epoll.epoll_add_read(&session->client);
           epoll.epoll_add_read(&session->upstream);

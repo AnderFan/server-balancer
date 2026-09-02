@@ -1,5 +1,6 @@
 #include <asm-generic/socket.h>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -122,13 +123,14 @@ int main(int argc, char *argv[]) {
   if (!argv[1]) {
     cerr << "Non argument id" << endl;
   }
-  string ip = "127.127.1." + string(argv[1]);
-  if (auto server = TCPserver::create_tcp(ip.c_str(), "3491",
-                                          SocketMode::Listener, true)) {
+  auto node_id = argv[1];
+  if (auto server =
+          TCPserver::create_tcp(nullptr, "3491", SocketMode::Listener, true)) {
+    cerr << node_id << " сервер запущен" << endl;
     EpollManage epoll;
     eventloop(*server, epoll);
   } else {
-    cerr << "Ошибка: " << strerror(errno) << endl;
+    cerr << "Ошибка от " << node_id << " : " << strerror(errno) << endl;
     return 1;
   }
 }

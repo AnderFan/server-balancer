@@ -25,7 +25,7 @@ struct Client {
   string write_buffer;
 };
 
-void eventloop(TCPserver &server, EpollManage &epoll) {
+void eventloop(TCPserver &server, EpollManage &epoll, char *node_id) {
   int ep_fd = epoll.epoll_create();
   auto ep_ev = epoll.epoll_ev;
 
@@ -46,10 +46,6 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
     for (int i = 0; i < nfds; i++) {
       auto *conn = static_cast<Connection *>(ep_ev[i].data.ptr);
       uint32_t revents = ep_ev[i].events;
-
-      if (conn->socket.get() == -1) {
-        continue;
-      }
 
       if (conn == &listener_conn) {
         while (true) {
@@ -79,7 +75,17 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
           }
           cout << "Принял данные от клиента: " << request << endl;
           if (!request.empty()) {
-            conn->out_buffer = request + "-Siroyeska\n";
+            string body = "--- Backend 3491 Echo ---\n" + request + "\n";
+
+            string response = "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: text/plain\r\n"
+                              "Content-Length: " +
+                              std::to_string(body.size()) +
+                              "\r\n"
+                              "Connection: close\r\n"
+                              "\r\n" +
+                              body;
+            conn->out_buffer = response;
             epoll.epoll_enable_write(conn);
           }
 
@@ -87,14 +93,7 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
             cout << "Клиент отключился. Вырубаю всё" << endl << endl;
             auto client_fd = conn->socket.get();
             epoll.epoll_remove(conn);
-            if (conn->peer)
-              epoll.epoll_remove(conn->peer);
-
-            conn->socket = Socket(-1);
-            if (conn->peer)
-              conn->peer->socket = Socket(-1);
-
-            erase_list.push_back(client_fd);
+            sessions.erase(client_fd);
           }
         }
 
@@ -105,17 +104,15 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
             cerr << "sendall error: " << strerror(errno) << endl;
           }
           if (conn->out_buffer.empty()) {
-            cout << "Отправил сыроежку" << endl;
             conn->out_buffer.clear();
             epoll.epoll_disable_write(conn);
           }
+          auto client_fd = conn->socket.get();
+          epoll.epoll_remove(conn);
+          sessions.erase(client_fd);
         }
       }
     }
-    for (int key : erase_list) {
-      sessions.erase(key);
-    }
-    erase_list.clear();
   }
 }
 
@@ -128,7 +125,7 @@ int main(int argc, char *argv[]) {
           TCPserver::create_tcp(nullptr, "3491", SocketMode::Listener, true)) {
     cerr << node_id << " сервер запущен" << endl;
     EpollManage epoll;
-    eventloop(*server, epoll);
+    eventloop(*server, epoll, node_id);
   } else {
     cerr << "Ошибка от " << node_id << " : " << strerror(errno) << endl;
     return 1;

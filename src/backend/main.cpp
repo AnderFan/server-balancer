@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstring>
 #include <fcntl.h>
+#include <format>
 #include <iostream>
 #include <memory>
 #include <netdb.h>
@@ -25,7 +26,7 @@ struct Client {
   string write_buffer;
 };
 
-void eventloop(TCPserver &server, EpollManage &epoll, char *node_id) {
+void eventloop(TCPserver &server, EpollManage &epoll, const char *node_id) {
   int ep_fd = epoll.epoll_create();
   auto ep_ev = epoll.epoll_ev;
 
@@ -70,19 +71,21 @@ void eventloop(TCPserver &server, EpollManage &epoll, char *node_id) {
       } else {
         if (revents & EPOLLIN) {
           auto [request, status] = recvall(conn->socket.get());
-          if (request.size() > 2) { // Убираем \n
-            request.erase(request.size() - 2);
-          }
-          cout << "Принял данные от клиента: " << request << endl;
+          cout << "принял данные от клиента: " << request << endl;
           if (!request.empty()) {
-            string body = "--- Backend 3491 Echo ---\n" + request + "\n";
+            string backend_id = format("backend-349{}", node_id);
+
+            string body = "--- backend 3491 echo ---\n" + request + "\n";
 
             string response = "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: text/plain\r\n"
-                              "Content-Length: " +
+                              "content-type: text/plain\r\n"
+                              "content-length: " +
                               std::to_string(body.size()) +
                               "\r\n"
-                              "Connection: close\r\n"
+                              "connection: close\r\n"
+                              "X-Backend-Id: " +
+                              backend_id +
+                              "\r\n"
                               "\r\n" +
                               body;
             conn->out_buffer = response;

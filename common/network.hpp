@@ -75,6 +75,7 @@ struct Connection {
   Socket socket;
   Connection *peer;
   std::string out_buffer;
+  bool close_on_empty = false;
 };
 
 struct Server {
@@ -149,7 +150,7 @@ public:
       if (::bind(sock.get(), res->ai_addr, res->ai_addrlen) != 0) {
         return std::nullopt;
       }
-      listen(sock.get(), 69);
+      listen(sock.get(), 128);
     }
 
     if (mode == SocketMode::Connector) {

@@ -131,7 +131,7 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
         continue;
       }
 
-      if (conn->peer == nullptr) {
+      if (conn == &listener_conn) {
         while (true) {
           auto [client, status] = accept_fd(conn->socket.get(), true);
           if (status != Status::Ok) {
@@ -163,25 +163,23 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
       } else {
         if (revents & EPOLLIN) {
           auto [request, status] = recvall(conn->socket.get());
-          if (!request.empty()) {
-            conn->peer->out_buffer = request;
+          if (!request.empty() && conn->peer) {
+            conn->peer->out_buffer += request;
             cout << "Записано " << conn->peer->out_buffer << endl;
             epoll.epoll_enable_write(conn->peer);
           }
-          if (status == Status::Disconect) {
-            cout << "ЗАКРЫВАЕМ ВСЁ НАХУЙ" << conn->socket.get() << endl;
+          if (status == Status::Disconect || status == Status::Error) {
+            cout << "Отключаю" << conn->socket.get() << endl;
             auto client_fd = conn->socket.get();
+            if (conn->peer) {
+              conn->peer->close_on_empty = true;
+              conn->peer->peer = nullptr;
+            }
             epoll.epoll_remove(conn);
-            if (conn->peer)
-              epoll.epoll_remove(conn->peer);
-
             conn->socket = Socket(-1);
-            if (conn->peer)
-              conn->peer->socket = Socket(-1);
-
-            erase_list.push_back(client_fd);
+            if (sessions.contains(client_fd))
+              erase_list.push_back(client_fd);
           }
-          continue;
         }
       }
       if (revents & EPOLLOUT) {
@@ -191,8 +189,15 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
         }
         if (conn->out_buffer.empty()) {
           cout << "Отправил" << endl;
-          conn->out_buffer.clear();
           epoll.epoll_disable_write(conn);
+
+          if (conn->close_on_empty) {
+            auto fd = conn->socket.get();
+            epoll.epoll_remove(conn);
+            conn->socket = Socket(-1);
+            if (sessions.contains(fd))
+              erase_list.push_back(fd);
+          }
         }
       }
     }
